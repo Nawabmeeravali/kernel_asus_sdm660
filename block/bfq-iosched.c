@@ -643,7 +643,10 @@ bfq_bfqq_resume_state(struct bfq_queue *bfqq, struct bfq_io_cq *bic)
 		bfq_clear_bfqq_IO_bound(bfqq);
 
 	bfqq->wr_coeff = bic->saved_wr_coeff;
+	bfqq->wr_start_at_switch_to_srt = bic->saved_wr_start_at_switch_to_srt;
+	BUG_ON(time_is_after_jiffies(bfqq->wr_start_at_switch_to_srt));
 	bfqq->last_wr_start_finish = bic->saved_last_wr_start_finish;
+	BUG_ON(time_is_after_jiffies(bfqq->last_wr_start_finish));
 
 	if (bfqq->wr_coeff > 1 && (bfq_bfqq_in_large_burst(bfqq) ||
 	    time_is_before_jiffies(bfqq->last_wr_start_finish +
@@ -1106,6 +1109,7 @@ static void bfq_update_bfqq_wr_on_rq_arrival(struct bfq_data *bfqd,
 			bfqq->wr_coeff = bfqd->bfq_wr_coeff;
 			bfqq->wr_cur_max_time = bfq_wr_duration(bfqd);
 		} else {
+			bfqq->wr_start_at_switch_to_srt = jiffies;
 			bfqq->wr_coeff = bfqd->bfq_wr_coeff *
 				BFQ_SOFTRT_WEIGHT_FACTOR;
 			bfqq->wr_cur_max_time =
@@ -1139,32 +1143,13 @@ static void bfq_update_bfqq_wr_on_rq_arrival(struct bfq_data *bfqd,
 				     jiffies,
 				     jiffies_to_msecs(bfqq->
 						      wr_cur_max_time));
-		} else if (time_before(
-				   bfqq->last_wr_start_finish +
-				   bfqq->wr_cur_max_time,
-				   jiffies +
-				   bfqd->bfq_wr_rt_max_time) &&
-			   soft_rt) {
+		} else if (soft_rt) {
 			/*
-			 * The remaining weight-raising time is lower
-			 * than bfqd->bfq_wr_rt_max_time, which means
-			 * that the application is enjoying weight
-			 * raising either because deemed soft-rt in
-			 * the near past, or because deemed interactive
-			 * a long ago.
-			 * In both cases, resetting now the current
-			 * remaining weight-raising time for the
-			 * application to the weight-raising duration
-			 * for soft rt applications would not cause any
-			 * latency increase for the application (as the
-			 * new duration would be higher than the
-			 * remaining time).
-			 *
-			 * In addition, the application is now meeting
-			 * the requirements for being deemed soft rt.
-			 * In the end we can correctly and safely
-			 * (re)charge the weight-raising duration for
-			 * the application with the weight-raising
+			 * The application is now or still meeting the
+			 * requirements for being deemed soft rt.  We
+			 * can then correctly and safely (re)charge
+			 * the weight-raising duration for the
+			 * application with the weight-raising
 			 * duration for soft rt applications.
 			 *
 			 * In particular, doing this recharge now, i.e.,
@@ -1188,14 +1173,22 @@ static void bfq_update_bfqq_wr_on_rq_arrival(struct bfq_data *bfqd,
 			 *    latency because the application is not
 			 *    weight-raised while they are pending.
 			 */
+			if (bfqq->wr_cur_max_time !=
+				bfqd->bfq_wr_rt_max_time) {
+				bfqq->wr_start_at_switch_to_srt =
+					bfqq->last_wr_start_finish;
+                BUG_ON(time_is_after_jiffies(bfqq->last_wr_start_finish));
+
+				bfqq->wr_cur_max_time =
+					bfqd->bfq_wr_rt_max_time;
+				bfqq->wr_coeff = bfqd->bfq_wr_coeff *
+					BFQ_SOFTRT_WEIGHT_FACTOR;
+				bfq_log_bfqq(bfqd, bfqq,
+					     "switching to soft_rt wr");
+			} else
+				bfq_log_bfqq(bfqd, bfqq,
+					"moving forward soft_rt wr duration");
 			bfqq->last_wr_start_finish = jiffies;
-			bfqq->wr_cur_max_time =
-				bfqd->bfq_wr_rt_max_time;
-			bfqq->wr_coeff = bfqd->bfq_wr_coeff *
-				BFQ_SOFTRT_WEIGHT_FACTOR;
-			bfq_log_bfqq(bfqd, bfqq,
-				     "switching to soft_rt wr, or "
-				     " just moving forward duration");
 		}
 	}
 }
@@ -1653,11 +1646,16 @@ static void bfq_bfqq_end_wr(struct bfq_queue *bfqq)
 		bfqq->bfqd->wr_busy_queues--;
 	bfqq->wr_coeff = 1;
 	bfqq->wr_cur_max_time = 0;
+	bfqq->last_wr_start_finish = jiffies;
 	/*
 	 * Trigger a weight change on the next invocation of
 	 * __bfq_entity_update_weight_prio.
 	 */
 	bfqq->entity.prio_changed = 1;
+	bfq_log_bfqq(bfqq->bfqd, bfqq,
+		     "end_wr: wrais ending at %lu, rais_max_time %u",
+		     bfqq->last_wr_start_finish,
+		     jiffies_to_msecs(bfqq->wr_cur_max_time));
 	bfq_log_bfqq(bfqq->bfqd, bfqq, "end_wr: wr_busy %d",
 		     bfqq->bfqd->wr_busy_queues);
 }
@@ -1930,6 +1928,7 @@ static void bfq_bfqq_save_state(struct bfq_queue *bfqq)
 	bic->saved_in_large_burst = bfq_bfqq_in_large_burst(bfqq);
 	bic->was_in_burst_list = !hlist_unhashed(&bfqq->burst_list_node);
 	bic->saved_wr_coeff = bfqq->wr_coeff;
+	bic->saved_wr_start_at_switch_to_srt = bfqq->wr_start_at_switch_to_srt;
 	bic->saved_last_wr_start_finish = bfqq->last_wr_start_finish;
 	BUG_ON(time_is_after_jiffies(bfqq->last_wr_start_finish));
 }
@@ -1956,6 +1955,40 @@ bfq_merge_bfqqs(struct bfq_data *bfqd, struct bfq_io_cq *bic,
 	if (bfq_bfqq_IO_bound(bfqq))
 		bfq_mark_bfqq_IO_bound(new_bfqq);
 	bfq_clear_bfqq_IO_bound(bfqq);
+
+	/*
+	 * If bfqq is weight-raised, then let new_bfqq inherit
+	 * weight-raising. To reduce false positives, neglect the case
+	 * where bfqq has just been created, but has not yet made it
+	 * to be weight-raised (which may happen because EQM may merge
+	 * bfqq even before bfq_add_request is executed for the first
+	 * time for bfqq). Handling this case would however be very
+	 * easy, thanks to the flag just_created.
+	 */
+	if (new_bfqq->wr_coeff == 1 && bfqq->wr_coeff > 1) {
+		new_bfqq->wr_coeff = bfqq->wr_coeff;
+		new_bfqq->wr_cur_max_time = bfqq->wr_cur_max_time;
+		new_bfqq->last_wr_start_finish = bfqq->last_wr_start_finish;
+		new_bfqq->wr_start_at_switch_to_srt = bfqq->wr_start_at_switch_to_srt;
+		if (bfq_bfqq_busy(new_bfqq))
+			bfqd->wr_busy_queues++;
+		new_bfqq->entity.prio_changed = 1;
+		bfq_log_bfqq(bfqd, new_bfqq,
+			     "wr start after merge with %d, rais_max_time %u",
+			     bfqq->pid,
+			     jiffies_to_msecs(bfqq->wr_cur_max_time));
+	}
+
+	if (bfqq->wr_coeff > 1) { /* bfqq has given its wr to new_bfqq */
+		bfqq->wr_coeff = 1;
+		bfqq->entity.prio_changed = 1;
+		if (bfq_bfqq_busy(bfqq))
+			bfqd->wr_busy_queues--;
+	}
+
+	bfq_log_bfqq(bfqd, new_bfqq, "merge_bfqqs: wr_busy %d",
+		     bfqd->wr_busy_queues);
+
 	/*
 	 * Grab a reference to the bic, to prevent it from being destroyed
 	 * before being possibly touched by a bfq_split_bfqq().
@@ -2116,7 +2149,8 @@ static void __bfq_set_in_service_queue(struct bfq_data *bfqd,
 				       max_t(unsigned long,
 					     bfqq->last_wr_start_finish,
 					     bfqq->budget_timeout));
-		       }
+			       bfqq->last_wr_start_finish = jiffies;
+			}
 		}
 
 		bfq_set_budget_timeout(bfqd, bfqq);
@@ -3491,16 +3525,26 @@ static void bfq_update_wr_data(struct bfq_data *bfqd, struct bfq_queue *bfqq)
 		 * exceeded the acceptable number of cooperations,
 		 * then end weight raising.
 		 */
-		if (bfq_bfqq_in_large_burst(bfqq) ||
-		    bfq_bfqq_cooperations(bfqq) >= bfqd->bfq_coop_thresh ||
-		    time_is_before_jiffies(bfqq->last_wr_start_finish +
-					   bfqq->wr_cur_max_time)) {
-			bfqq->last_wr_start_finish = jiffies;
-			bfq_log_bfqq(bfqd, bfqq,
-				     "wrais ending at %lu, rais_max_time %u",
-				     bfqq->last_wr_start_finish,
-				     jiffies_to_msecs(bfqq->wr_cur_max_time));
+		if (bfq_bfqq_in_large_burst(bfqq))
 			bfq_bfqq_end_wr(bfqq);
+		else if (time_is_before_jiffies(bfqq->last_wr_start_finish +
+					   bfqq->wr_cur_max_time)) {
+			if (bfqq->wr_cur_max_time != bfqd->bfq_wr_rt_max_time ||
+			time_is_before_jiffies(bfqq->wr_start_at_switch_to_srt +
+					bfq_wr_duration(bfqd)))
+				bfq_bfqq_end_wr(bfqq);
+			else {
+				/* switch back to interactive wr */
+				bfqq->wr_coeff = bfqd->bfq_wr_coeff;
+				bfqq->wr_cur_max_time = bfq_wr_duration(bfqd);
+				bfqq->last_wr_start_finish =
+					bfqq->wr_start_at_switch_to_srt;
+				BUG_ON(time_is_after_jiffies(
+					       bfqq->last_wr_start_finish));
+				bfqq->entity.prio_changed = 1;
+				bfq_log_bfqq(bfqd, bfqq,
+					"back to interactive wr");
+			}
 		}
 	}
 	/* Update weight both if it must be raised and if it must be lowered */
@@ -3907,8 +3951,10 @@ static void bfq_init_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 
 	bfqq->wr_coeff = 1;
 	bfqq->last_wr_start_finish = jiffies;
+	bfqq->wr_start_at_switch_to_srt = bfq_smallest_from_now();
 	bfqq->budget_timeout = bfq_smallest_from_now();
 	bfqq->split_time = bfq_smallest_from_now();
+
 	/*
 	 * Set to the value for which bfqq will not be deemed as
 	 * soft rt when it becomes backlogged.
