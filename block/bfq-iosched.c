@@ -641,27 +641,20 @@ bfq_bfqq_resume_state(struct bfq_queue *bfqq, struct bfq_io_cq *bic)
 		bfq_mark_bfqq_IO_bound(bfqq);
 	else
 		bfq_clear_bfqq_IO_bound(bfqq);
-	/* Assuming that the flag in_large_burst is already correctly set */
-	if (bic->wr_time_left && bfqq->bfqd->low_latency &&
-	    !bfq_bfqq_in_large_burst(bfqq) &&
-	    bic->cooperations < bfqq->bfqd->bfq_coop_thresh) {
-		/*
-		 * Start a weight raising period with the duration given by
-		 * the raising_time_left snapshot.
-		 */
-		if (bfq_bfqq_busy(bfqq))
-			bfqq->bfqd->wr_busy_queues++;
-		bfqq->wr_coeff = bfqq->bfqd->bfq_wr_coeff;
-		bfqq->wr_cur_max_time = bic->wr_time_left;
-		bfqq->last_wr_start_finish = jiffies;
-		bfqq->entity.prio_changed = 1;
+
+	bfqq->wr_coeff = bic->saved_wr_coeff;
+	bfqq->last_wr_start_finish = bic->saved_last_wr_start_finish;
+
+	if (bfqq->wr_coeff > 1 && (bfq_bfqq_in_large_burst(bfqq) ||
+	    time_is_before_jiffies(bfqq->last_wr_start_finish +
+				   bfqq->wr_cur_max_time))) {
+		bfq_log_bfqq(bfqq->bfqd, bfqq,
+		    "resume state: switching off wr");
+
+		bfqq->wr_coeff = 1;
 	}
-	/*
-	 * Clear wr_time_left to prevent bfq_bfqq_save_state() from
-	 * getting confused about the queue's need of a weight-raising
-	 * period.
-	 */
-	bic->wr_time_left = 0;
+	/* make sure weight will be updated, however we got here */
+	bfqq->entity.prio_changed = 1;
 }
 
 static int bfqq_process_refs(struct bfq_queue *bfqq)
@@ -1922,53 +1915,22 @@ check_scheduled:
 
 static void bfq_bfqq_save_state(struct bfq_queue *bfqq)
 {
+	struct bfq_io_cq *bic = bfqq->bic;
+
 	/*
 	 * If !bfqq->bic, the queue is already shared or its requests
 	 * have already been redirected to a shared queue; both idle window
 	 * and weight raising state have already been saved. Do nothing.
 	 */
-	if (!bfqq->bic)
+	if (!bic)
 		return;
-	if (bfqq->bic->wr_time_left)
-		/*
-		 * This is the queue of a just-started process, and would
-		 * deserve weight raising: we set wr_time_left to the full
-		 * weight-raising duration to trigger weight-raising when
-		 * and if the queue is split and the first request of the
-		 * queue is enqueued.
-		 */
-		bfqq->bic->wr_time_left = bfq_wr_duration(bfqq->bfqd);
-	else if (bfqq->wr_coeff > 1) {
-		unsigned long wr_duration =
-			jiffies - bfqq->last_wr_start_finish;
-		/*
-		 * It may happen that a queue's weight raising period lasts
-		 * longer than its wr_cur_max_time, as weight raising is
-		 * handled only when a request is enqueued or dispatched (it
-		 * does not use any timer). If the weight raising period is
-		 * about to end, don't save it.
-		 */
-		if (bfqq->wr_cur_max_time <= wr_duration)
-			bfqq->bic->wr_time_left = 0;
-		else
-			bfqq->bic->wr_time_left =
-				bfqq->wr_cur_max_time - wr_duration;
-		/*
-		 * The bfq_queue is becoming shared or the requests of the
-		 * process owning the queue are being redirected to a shared
-		 * queue. Stop the weight raising period of the queue, as in
-		 * both cases it should not be owned by an interactive or
-		 * soft real-time application.
-		 */
-		bfq_bfqq_end_wr(bfqq);
-	} else
-		bfqq->bic->wr_time_left = 0;
-	bfqq->bic->saved_idle_window = bfq_bfqq_idle_window(bfqq);
-	bfqq->bic->saved_IO_bound = bfq_bfqq_IO_bound(bfqq);
-	bfqq->bic->saved_in_large_burst = bfq_bfqq_in_large_burst(bfqq);
-	bfqq->bic->was_in_burst_list = !hlist_unhashed(&bfqq->burst_list_node);
-	bfqq->bic->cooperations++;
-	bfqq->bic->failed_cooperations = 0;
+
+	bic->saved_idle_window = bfq_bfqq_idle_window(bfqq);
+	bic->saved_IO_bound = bfq_bfqq_IO_bound(bfqq);
+	bic->saved_in_large_burst = bfq_bfqq_in_large_burst(bfqq);
+	bic->was_in_burst_list = !hlist_unhashed(&bfqq->burst_list_node);
+	bic->saved_wr_coeff = bfqq->wr_coeff;
+	bic->saved_last_wr_start_finish = bfqq->last_wr_start_finish;
 }
 
 static void bfq_get_bic_reference(struct bfq_queue *bfqq)
@@ -3927,7 +3889,7 @@ static void bfq_init_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 	bfqq->pid = pid;
 
 	bfqq->wr_coeff = 1;
-	bfqq->last_wr_start_finish = bfq_smallest_from_now();
+	bfqq->last_wr_start_finish = jiffies;
 	bfqq->budget_timeout = bfq_smallest_from_now();
 	bfqq->split_time = bfq_smallest_from_now();
 	/*
