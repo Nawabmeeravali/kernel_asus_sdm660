@@ -288,8 +288,8 @@ static int crypto_skcipher_report(struct sk_buff *skb, struct crypto_alg *alg)
 	struct skcipher_alg *skcipher = container_of(alg, struct skcipher_alg,
 						     base);
 
-	strlcpy(rblkcipher.type, "skcipher", sizeof(rblkcipher.type));
-	strlcpy(rblkcipher.geniv, "<none>", sizeof(rblkcipher.geniv));
+	strncpy(rblkcipher.type, "skcipher", sizeof(rblkcipher.type));
+	strncpy(rblkcipher.geniv, "<none>", sizeof(rblkcipher.geniv));
 
 	rblkcipher.blocksize = alg->cra_blocksize;
 	rblkcipher.min_keysize = skcipher->min_keysize;
