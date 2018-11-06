@@ -166,12 +166,14 @@
 				reg = <2>;
 				qcom,mempool-page-size = <65536>;
 				qcom,mempool-reserved = <256>;
+				qcom,mempool-allocate;
 			};
 			/* 1M Page Pool configuration */
 			qcom,gpu-mempool@3 {
 				reg = <3>;
 				qcom,mempool-page-size = <1048576>;
 				qcom,mempool-reserved = <32>;
+				qcom,mempool-allocate;
 			};
 		};
 
